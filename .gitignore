@@ -1,0 +1,6 @@
+bin/
+.otto*
+.github
+.env
+
+tmp
