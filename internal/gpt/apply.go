@@ -61,6 +61,14 @@ func updateIngredient(r *domain.Recipe, act Action) error {
 		return fmt.Errorf("ingredient %q not found", act.IngredientName)
 	}
 	ing := &r.Ingredients[idx]
+	oldName := ing.Name
+	if act.NewIngredientName != "" {
+		ing.Name = act.NewIngredientName
+		// Safety net: replace the old ingredient name in all step
+		// instructions so the recipe stays consistent even if the
+		// AI forgot to emit update_step actions.
+		replaceInSteps(r, oldName, act.NewIngredientName)
+	}
 	if act.Quantity > 0 {
 		ing.Quantity = act.Quantity
 	}
@@ -71,6 +79,32 @@ func updateIngredient(r *domain.Recipe, act Action) error {
 		ing.SizeDescriptor = act.SizeDescriptor
 	}
 	return nil
+}
+
+// replaceInSteps does a case-insensitive replacement of oldName with
+// newName in every step instruction.
+func replaceInSteps(r *domain.Recipe, oldName, newName string) {
+	lower := strings.ToLower(oldName)
+	for i, step := range r.Steps {
+		instrLower := strings.ToLower(step.Instruction)
+		if strings.Contains(instrLower, lower) {
+			// Preserve original casing of surrounding text by doing
+			// a positional replacement.
+			result := make([]byte, 0, len(step.Instruction))
+			src := step.Instruction
+			for {
+				pos := strings.Index(strings.ToLower(src), lower)
+				if pos == -1 {
+					result = append(result, src...)
+					break
+				}
+				result = append(result, src[:pos]...)
+				result = append(result, newName...)
+				src = src[pos+len(oldName):]
+			}
+			r.Steps[i].Instruction = string(result)
+		}
+	}
 }
 
 func removeIngredient(r *domain.Recipe, act Action) error {

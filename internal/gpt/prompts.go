@@ -42,9 +42,10 @@ Response schema:
 
 Action types and their fields:
 
-1. "update_ingredient" — change an existing ingredient
+1. "update_ingredient" — change an existing ingredient (rename, adjust quantity, etc.)
    { "type": "update_ingredient", "ingredient_name": "tomato", "quantity": 4, "unit": "pieces", "size_descriptor": "small" }
-   Only include fields that change. "ingredient_name" identifies which ingredient to update.
+   To rename/substitute: { "type": "update_ingredient", "ingredient_name": "margarine", "new_ingredient_name": "butter" }
+   Only include fields that change. "ingredient_name" identifies which ingredient to update. "new_ingredient_name" renames it.
 
 2. "remove_ingredient" — remove an ingredient
    { "type": "remove_ingredient", "ingredient_name": "chili flakes" }
@@ -71,7 +72,8 @@ Rules:
 - Respond ONLY with the JSON object. No text before or after.
 - "summary" must be 1-3 sentences, TTS-friendly, no markdown, no emojis.
 - If the request is unclear, set "actions" to [] and ask a clarifying question in "summary".
-- When updating ingredients, also update any step instructions that reference the old quantities/sizes.
+- CRITICAL: When an ingredient is renamed or substituted (new_ingredient_name), you MUST also emit "update_step" actions for EVERY step whose instruction text mentions the old ingredient name. Replace the old name with the new one in those instructions. Failing to do this leaves the recipe in an inconsistent state.
+- When updating ingredient quantities/sizes, also update any step instructions that reference the old quantities/sizes.
 - Use sensible cooking knowledge to adjust related quantities.
 
 Modification judgment — you MUST evaluate every request against these tiers:

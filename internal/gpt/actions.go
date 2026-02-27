@@ -31,10 +31,11 @@ type Action struct {
 	Type ActionType `json:"type"`
 
 	// Ingredient fields (update/add/remove)
-	IngredientName string  `json:"ingredient_name,omitempty"`
-	Quantity       float64 `json:"quantity,omitempty"`
-	Unit           string  `json:"unit,omitempty"`
-	SizeDescriptor string  `json:"size_descriptor,omitempty"`
+	IngredientName    string  `json:"ingredient_name,omitempty"`
+	NewIngredientName string  `json:"new_ingredient_name,omitempty"`
+	Quantity          float64 `json:"quantity,omitempty"`
+	Unit              string  `json:"unit,omitempty"`
+	SizeDescriptor    string  `json:"size_descriptor,omitempty"`
 
 	// Step fields (update/add/remove)
 	StepIndex   int    `json:"step_index,omitempty"` // 1-based
