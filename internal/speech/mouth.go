@@ -58,15 +58,16 @@ type Mouth struct {
 	log    *logger.Logger
 	cache  *AudioCache
 
-	mu             sync.Mutex
-	queue          []SpeechRequest
-	notify         chan struct{}
-	speaking       bool
-	interrupted    bool   // set by Interrupt(), checked between chunks
-	chunkSize      int    // chars per TTS request, 0 = no chunking
-	cacheDir       string // filesystem cache directory
-	diskWrite      bool   // persist new cache entries to disk
-	lastSpokenText string // most recent non-filler text spoken
+	mu               sync.Mutex
+	queue            []SpeechRequest
+	notify           chan struct{}
+	speaking         bool
+	interrupted      bool                // set by Interrupt(), checked between chunks
+	chunkSize        int                 // chars per TTS request, 0 = no chunking
+	cacheDir         string              // filesystem cache directory
+	diskWrite        bool                // persist new cache entries to disk
+	lastSpokenText   string              // most recent non-filler text spoken
+	onSpeakingChange func(speaking bool) // called when speaking state changes
 }
 
 // NewMouth creates a speech dispatcher with the given TTS client and player.
@@ -137,6 +138,14 @@ func (m *Mouth) IsSpeaking() bool {
 	return m.speaking
 }
 
+// OnSpeakingChange registers a callback invoked when the mouth starts
+// or stops speaking.  Useful for muting/unmuting the mic.
+func (m *Mouth) OnSpeakingChange(fn func(speaking bool)) {
+	m.mu.Lock()
+	m.onSpeakingChange = fn
+	m.mu.Unlock()
+}
+
 // QueueLen returns the number of pending speech requests.
 func (m *Mouth) QueueLen() int {
 	m.mu.Lock()
@@ -200,7 +209,11 @@ func (m *Mouth) drain(ctx context.Context) {
 
 		m.mu.Lock()
 		m.speaking = true
+		cb := m.onSpeakingChange
 		m.mu.Unlock()
+		if cb != nil {
+			cb(true)
+		}
 
 		m.process(ctx, item)
 
@@ -213,7 +226,11 @@ func (m *Mouth) drain(ctx context.Context) {
 
 		m.mu.Lock()
 		m.speaking = false
+		cb = m.onSpeakingChange
 		m.mu.Unlock()
+		if cb != nil {
+			cb(false)
+		}
 	}
 }
 

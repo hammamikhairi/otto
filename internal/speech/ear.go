@@ -2,66 +2,67 @@ package speech
 
 import (
 	"context"
+	"math"
 	"os/exec"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gordonklaus/portaudio"
 	audiotranscriber "github.com/sklyt/whisper/pkg"
 
 	"github.com/hammamikhairi/ottocook/internal/logger"
+	"github.com/hammamikhairi/ottocook/internal/wakeword"
 )
 
 // earState represents the Ear's listening mode.
 type earState int
 
 const (
-	// earDormant — passively scanning short clips for the wake word.
+	// earDormant — waiting for the wakeword detector to fire.
 	earDormant earState = iota
 	// earListening — wake word detected, actively capturing the command.
 	earListening
+	// earMuted — ear is asleep while mouth speaks.
+	earMuted
 )
 
-// Default wake phrases. Any of these at the start of a transcription
-// (case-insensitive) triggers active listening.
-var defaultWakeWords = []string{
+// EarState exports the ear state type for consumers (e.g. display).
+type EarState = earState
+
+// Exported constants for consumer code.
+const (
+	EarDormant   = earDormant
+	EarListening = earListening
+	EarMuted     = earMuted
+)
+
+// wakeWordTexts are patterns that may bleed into the whisper
+// transcription if the tail of the wake-word utterance overlaps
+// with the start of recording.  Used only for cleanup, not detection.
+var wakeWordTexts = []string{
+	"hey otto",
+	"otto",
 	"hey chef",
 	"otto cook",
 	"ottocook",
 	"hey, chef",
 	"hey shef",
-	"la chef",
-	"lashef",
-	"Mr chef",
-	"Otto",
 }
 
 // envAnnotation matches whisper environmental annotations like
 // "(keyboard clicking)", "[laughter]", "(speaking French)", etc.
 var envAnnotation = regexp.MustCompile(`[\(\[][a-zA-Z][a-zA-Z\s]*[\)\]]`)
 
+// ── Options ──────────────────────────────────────────────────────
+
 // EarOption configures the Ear.
 type EarOption func(*Ear)
-
-// WithRecordDuration sets how long each active-listening chunk lasts.
-func WithRecordDuration(d time.Duration) EarOption {
-	return func(e *Ear) { e.recordDuration = d }
-}
-
-// WithSilenceGap sets the pause between recording chunks.
-func WithSilenceGap(d time.Duration) EarOption {
-	return func(e *Ear) { e.silenceGap = d }
-}
 
 // WithTempDir sets the directory for temporary WAV files.
 func WithTempDir(dir string) EarOption {
 	return func(e *Ear) { e.tempDir = dir }
-}
-
-// WithWakeWords overrides the default wake phrases.
-func WithWakeWords(words ...string) EarOption {
-	return func(e *Ear) { e.wakeWords = words }
 }
 
 // WithListenTimeout sets how long the ear stays in active listening
@@ -70,61 +71,55 @@ func WithListenTimeout(d time.Duration) EarOption {
 	return func(e *Ear) { e.listenTimeout = d }
 }
 
-// WithDormantDuration sets how long each dormant probe recording lasts.
-// Shorter = more responsive wake-word detection, but more CPU.
-func WithDormantDuration(d time.Duration) EarOption {
-	return func(e *Ear) { e.dormantDuration = d }
-}
+// ── Ear ──────────────────────────────────────────────────────────
 
-// Ear provides wake-word-triggered speech-to-text input using a local
-// Whisper model.
+// Ear provides wake-word-triggered speech-to-text input.
 //
 // Lifecycle:
-//  1. DORMANT — records short clips and checks for a wake word.
-//     Everything else is silently discarded (no spam).
-//  2. LISTENING — wake word detected → interrupt the Mouth (shut it up)
-//     → record longer chunks and accumulate the user's command until
-//     silence or timeout.
-//  3. The accumulated text (minus the wake word) is sent through the
-//     channel, and the ear goes back to dormant.
+//  1. DORMANT — the openWakeWord ONNX detector runs continuously on
+//     its own audio stream.  Zero whisper CPU during this phase.
+//  2. LISTENING — detector fires → interrupt the Mouth → open a
+//     single Whisper transcriber with RMS-based silence detection
+//     → capture the full command → send text on the channel.
+//  3. Return to dormant.
 type Ear struct {
 	whisperBin string
 	modelPath  string
 	tempDir    string
 	log        *logger.Logger
-	mouth      *Mouth // optional — interrupt on wake word
+	mouth      *Mouth             // optional — interrupt on wake word
+	detector   *wakeword.Detector // ONNX-based wake word detector
 
-	wakeWords       []string
-	recordDuration  time.Duration // active listening chunk length
-	dormantDuration time.Duration // wake-word probe chunk length
-	silenceGap      time.Duration
-	listenTimeout   time.Duration // max active listening window
+	listenTimeout time.Duration // max active listening window
 
-	mu     sync.Mutex
-	muted  bool
-	state  earState
-	textCh chan string // transcribed text flows here
+	mu            sync.Mutex
+	muted         bool
+	state         earState
+	textCh        chan string          // transcribed text flows here
+	wakeCh        chan struct{}        // wakeword detector signals here
+	cancelCh      chan struct{}        // externally cancel active listening
+	onStateChange func(state earState) // optional UI callback
 }
 
 // NewEar creates a wake-word-triggered voice input listener.
 //
 //   - whisperBin: path to the whisper-cli executable
-//   - modelPath:  path to the GGML model file
+//   - modelPath:  path to the Whisper GGML model file
+//   - detector:   pre-configured openWakeWord detector
 //   - mouth:      optional Mouth — will be interrupted when wake word is heard
-func NewEar(whisperBin, modelPath string, mouth *Mouth, log *logger.Logger, opts ...EarOption) *Ear {
+func NewEar(whisperBin, modelPath string, detector *wakeword.Detector, mouth *Mouth, log *logger.Logger, opts ...EarOption) *Ear {
 	e := &Ear{
-		whisperBin:      whisperBin,
-		modelPath:       modelPath,
-		tempDir:         ".otto-stt",
-		log:             log,
-		mouth:           mouth,
-		wakeWords:       defaultWakeWords,
-		recordDuration:  1 * time.Second,
-		dormantDuration: 3 * time.Second,
-		silenceGap:      300 * time.Millisecond,
-		listenTimeout:   15 * time.Second,
-		state:           earDormant,
-		textCh:          make(chan string, 8),
+		whisperBin:    whisperBin,
+		modelPath:     modelPath,
+		tempDir:       ".otto-stt",
+		log:           log,
+		mouth:         mouth,
+		detector:      detector,
+		listenTimeout: 15 * time.Second,
+		state:         earDormant,
+		textCh:        make(chan string, 8),
+		wakeCh:        make(chan struct{}, 1),
+		cancelCh:      make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -135,29 +130,73 @@ func NewEar(whisperBin, modelPath string, mouth *Mouth, log *logger.Logger, opts
 		log.Error("ear: whisper binary %q not found in PATH: %v", e.whisperBin, err)
 	}
 
+	// Wire the detector callback → wakeCh.
+	detector.OnDetected = func() {
+		select {
+		case e.wakeCh <- struct{}{}:
+		default: // already pending
+		}
+	}
+
 	return e
 }
 
-// C returns the channel that receives transcribed text. Read from this
-// in your main loop to get voice input.
+// C returns the channel that receives transcribed text.
 func (e *Ear) C() <-chan string {
 	return e.textCh
 }
 
+// OnStateChange registers a callback invoked when the ear transitions
+// between states (dormant, listening, muted).
+func (e *Ear) OnStateChange(fn func(state earState)) {
+	e.mu.Lock()
+	e.onStateChange = fn
+	e.mu.Unlock()
+}
+
 // Mute temporarily disables listening (e.g. during TTS playback).
+// Also pauses the wakeword detector so it doesn't fire on speaker
+// output.
 func (e *Ear) Mute() {
 	e.mu.Lock()
 	e.muted = true
+	curState := e.state
 	e.mu.Unlock()
-	e.log.Debug("ear: muted")
+	e.detector.Pause()
+	// Don't clobber earListening — the filler might trigger
+	// OnSpeakingChange(true) → Mute while we're already listening.
+	if curState != earListening {
+		e.setState(earMuted)
+	}
+	e.log.Debug("ear: muted (state=%d)", curState)
 }
 
-// Unmute re-enables listening.
+// CancelListening aborts an in-progress listening session (if any)
+// and returns the ear to dormant. Safe to call from any goroutine.
+func (e *Ear) CancelListening() {
+	if e.getState() != earListening {
+		return
+	}
+	select {
+	case e.cancelCh <- struct{}{}:
+		e.log.Debug("ear: listening cancelled by user")
+	default:
+	}
+}
+
+// Unmute re-enables listening and resumes the wakeword detector.
 func (e *Ear) Unmute() {
 	e.mu.Lock()
 	e.muted = false
+	// Don't clobber earListening — if doListening is active, we must not
+	// reset to dormant just because the mouth finished a filler line.
+	curState := e.state
 	e.mu.Unlock()
-	e.log.Debug("ear: unmuted")
+	if curState != earListening {
+		e.detector.Resume()
+		e.setState(earDormant)
+	}
+	e.log.Debug("ear: unmuted (state=%d)", curState)
 }
 
 func (e *Ear) isMuted() bool {
@@ -166,30 +205,34 @@ func (e *Ear) isMuted() bool {
 	return e.muted
 }
 
-// Run starts the wake-word listening loop. Blocks until ctx is cancelled.
-// Call this in a goroutine.
+// Run starts the ear.  Blocks until ctx is cancelled.  The wakeword
+// detector must already be running in its own goroutine.
 func (e *Ear) Run(ctx context.Context) {
-	e.log.Info("ear: started (dormant=%s, active=%s, timeout=%s, wake=%v)",
-		e.dormantDuration, e.recordDuration, e.listenTimeout, e.wakeWords)
+	e.log.Info("ear: started (timeout=%s)", e.listenTimeout)
+
+	// Initialise PortAudio once for the lifetime of the ear.
+	// Repeated Init/Terminate cycles corrupt the CoreAudio HAL on
+	// macOS, progressively reducing the gain seen by the concurrent
+	// malgo capture device.
+	if err := portaudio.Initialize(); err != nil {
+		e.log.Error("ear: portaudio init failed: %v", err)
+		return
+	}
+	defer portaudio.Terminate()
+	e.log.Debug("ear: portaudio initialized (once)")
 
 	for {
 		select {
 		case <-ctx.Done():
 			e.log.Info("ear: stopped")
 			return
-		default:
-		}
 
-		if e.isMuted() {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-
-		switch e.getState() {
-		case earDormant:
-			e.doDormant(ctx)
-		case earListening:
-			e.doListening(ctx)
+		case <-e.wakeCh:
+			if e.isMuted() {
+				e.log.Debug("ear: wake word ignored — muted")
+				continue
+			}
+			e.onWakeWord(ctx)
 		}
 	}
 }
@@ -205,11 +248,15 @@ func (e *Ear) getState() earState {
 func (e *Ear) setState(s earState) {
 	e.mu.Lock()
 	e.state = s
+	cb := e.onStateChange
 	e.mu.Unlock()
+	if cb != nil {
+		cb(s)
+	}
 }
 
-// waitForMouth blocks until the mouth finishes speaking (e.g. the
-// listening filler) so the microphone doesn't pick it up.
+// waitForMouth blocks until the mouth finishes speaking so the
+// microphone doesn't pick it up.
 func (e *Ear) waitForMouth(ctx context.Context) {
 	if e.mouth == nil {
 		return
@@ -223,41 +270,11 @@ func (e *Ear) waitForMouth(ctx context.Context) {
 	}
 }
 
-// ── Dormant mode ─────────────────────────────────────────────────
+// ── Wake word handling ───────────────────────────────────────────
 
-// doDormant records a short clip, transcribes it, and checks for the
-// wake word. If found, transitions to earListening. Everything else
-// is silently discarded.
-func (e *Ear) doDormant(ctx context.Context) {
-	// Echo prevention: don't record while the mouth is speaking.
-	if e.mouth != nil && (e.mouth.IsSpeaking() || e.mouth.QueueLen() > 0) {
-		time.Sleep(200 * time.Millisecond)
-		return
-	}
-
-	text := e.recordChunk(ctx, e.dormantDuration)
-
-	// Post-recording echo check: if the mouth started speaking during
-	// our recording, the audio is contaminated — discard it.
-	if e.mouth != nil && (e.mouth.IsSpeaking() || e.mouth.QueueLen() > 0) {
-		e.log.Debug("ear/dormant: discarding — mouth started during recording")
-		return
-	}
-
-	text = cleanTranscription(text)
-	if text == "" {
-		return
-	}
-
-	e.log.Debug("ear/dormant: heard %q", text)
-
-	remaining := e.stripWakeWord(text)
-	if remaining == "" {
-		// No wake word found — discard.
-		return
-	}
-
-	e.log.Info("ear: wake word detected in %q", text)
+// onWakeWord is called when the ONNX detector fires.
+func (e *Ear) onWakeWord(ctx context.Context) {
+	e.log.Info("ear: wake word detected!")
 
 	// Interrupt the mouth so it shuts up immediately.
 	if e.mouth != nil {
@@ -265,37 +282,49 @@ func (e *Ear) doDormant(ctx context.Context) {
 		e.log.Debug("ear: interrupted mouth")
 	}
 
-	// If the user said the wake word + a command in one breath
-	// (e.g. "hey chef next step"), send it directly — but clean
-	// hallucinations first so "Thank you." etc. don't slip through.
-	remaining = strings.TrimSpace(remaining)
-	remaining = cleanTranscription(remaining)
-	if remaining != "" && !isJustWakeWord(remaining) {
-		e.log.Info("ear: immediate command: %q", remaining)
-		select {
-		case e.textCh <- remaining:
-		case <-ctx.Done():
-		}
-		return
-	}
+	// Pause the wakeword detector while we listen — we don't want it
+	// fighting over the mic or re-triggering on echoed audio.
+	e.detector.Pause()
 
-	// Otherwise, switch to active listening for the command.
+	// Mark listening BEFORE the filler so that OnSpeakingChange
+	// callbacks (Mute/Unmute) know not to clobber this state.
+	e.setState(earListening)
+
 	// Speak a filler so the user knows we're listening.
 	if e.mouth != nil {
 		filler := LineListening()
 		e.mouth.Say(filler, PriorityCritical)
 		e.log.Debug("ear: said %q", filler)
 	}
+	sent := e.doListening(ctx)
 
-	e.setState(earListening)
+	if sent {
+		// Text was captured → an AI response is coming.  Mute so the
+		// detector stays quiet during TTS.  The OnSpeakingChange callback
+		// (mouth done → Unmute) will resume detection naturally.
+		e.Mute()
+	} else {
+		// Nothing captured.  No AI response coming, so just resume the
+		// detector directly (if not already muted by another path).
+		if !e.isMuted() {
+			e.detector.Resume()
+		}
+		e.setState(earDormant)
+	}
 }
 
 // ── Active listening mode ────────────────────────────────────────
 
-// doListening records chunks until the user stops talking (empty
-// transcription) or the listen timeout expires, then sends the
-// accumulated text and returns to dormant.
-func (e *Ear) doListening(ctx context.Context) {
+// doListening opens a single Whisper transcriber for the whole session
+// (mic acquired once, released once) and runs a lightweight PortAudio
+// monitor alongside it to measure RMS audio intensity.  The monitor
+// decides when the user has stopped talking: 4 continuous seconds of
+// silence after speech → done.  The transcriber's internal chunking
+// handles mid-sentence pauses just fine; we only control the outer
+// "are you done talking?" boundary.
+//
+// Returns true if transcribed text was sent on textCh.
+func (e *Ear) doListening(ctx context.Context) bool {
 	e.log.Info("ear: listening...")
 
 	// Grace period: wait for the mouth to finish saying the filler
@@ -305,139 +334,33 @@ func (e *Ear) doListening(ctx context.Context) {
 	case <-time.After(500 * time.Millisecond):
 	case <-ctx.Done():
 		e.setState(earDormant)
-		return
+		return false
 	}
 
-	deadline := time.After(e.listenTimeout)
-	var parts []string
-	emptyRuns := 0
-	hasHeardSpeech := false
-	// Before the user starts talking, allow more silence. Once they've
-	// started, a shorter gap means they're done.
-	const graceEmpty = 4      // empty chunks tolerated before first speech
-	const postSpeechEmpty = 2 // empty chunks tolerated after speech started
+	// ── RMS monitor stream ───────────────────────────────────────
+	const (
+		monSampleRate = 16000
+		monFrames     = 1024
+		rmsThresh     = 0.008 // below this = silence (≈ −42 dB)
+		silenceDur    = 4 * time.Second
+		graceDur      = 10 * time.Second // max wait before any speech
+	)
 
-	for {
-		select {
-		case <-ctx.Done():
-			e.setState(earDormant)
-			return
-		case <-deadline:
-			e.log.Debug("ear: listen timeout reached")
-			goto done
-		default:
-		}
-
-		chunk := e.recordChunk(ctx, e.recordDuration)
-		chunk = cleanTranscription(chunk)
-
-		if chunk == "" {
-			emptyRuns++
-			maxEmpty := graceEmpty
-			if hasHeardSpeech {
-				maxEmpty = postSpeechEmpty
-			}
-			if emptyRuns >= maxEmpty {
-				e.log.Debug("ear: silence detected, ending listen (heard_speech=%v)", hasHeardSpeech)
-				goto done
-			}
-			continue
-		}
-
-		emptyRuns = 0
-		hasHeardSpeech = true
-
-		// In case the user repeats the wake word mid-sentence, strip it.
-		chunk = e.stripWakeWordClean(chunk)
-		if chunk != "" {
-			e.log.Debug("ear/listen: chunk: %q", chunk)
-			parts = append(parts, chunk)
-		}
+	monBuf := make([]float32, monFrames)
+	monStream, err := portaudio.OpenDefaultStream(1, 0, float64(monSampleRate), monFrames, monBuf)
+	if err != nil {
+		e.log.Error("ear: monitor stream open failed: %v", err)
+		e.setState(earDormant)
+		return false
+	}
+	if err := monStream.Start(); err != nil {
+		e.log.Error("ear: monitor stream start failed: %v", err)
+		monStream.Close()
+		e.setState(earDormant)
+		return false
 	}
 
-done:
-	e.setState(earDormant)
-
-	combined := strings.TrimSpace(strings.Join(parts, " "))
-	if combined == "" {
-		e.log.Debug("ear: listening ended with no input")
-		return
-	}
-
-	e.log.Info("ear: heard command: %q", combined)
-
-	select {
-	case e.textCh <- combined:
-	case <-ctx.Done():
-	}
-}
-
-// ── Wake word matching ───────────────────────────────────────────
-
-// stripWakeWord checks if the text contains a wake word.
-// Returns the remaining text after the wake word, or "" if no wake
-// word was found. A return of " " (space only) means the wake word
-// was the entire utterance (or nothing meaningful followed it).
-func (e *Ear) stripWakeWord(text string) string {
-	lower := strings.ToLower(text)
-	for _, w := range e.wakeWords {
-		wl := strings.ToLower(w)
-
-		// Exact match — wake word only, no command yet.
-		if lower == wl {
-			return " "
-		}
-
-		// Wake word at the start followed by more text.
-		if strings.HasPrefix(lower, wl) {
-			rest := strings.TrimSpace(text[len(wl):])
-			rest = strings.TrimLeft(rest, " ,.\n\r\t")
-			if rest == "" {
-				return " "
-			}
-			return rest
-		}
-
-		// Wake word somewhere in the middle (e.g. "blah hey chef next").
-		if idx := strings.Index(lower, wl); idx >= 0 {
-			rest := strings.TrimSpace(text[idx+len(wl):])
-			if rest == "" {
-				return " "
-			}
-			return rest
-		}
-	}
-	return ""
-}
-
-// stripWakeWordClean removes any wake word from the text and returns
-// what's left. Used during active listening to clean mid-sentence
-// repetitions.
-func (e *Ear) stripWakeWordClean(text string) string {
-	lower := strings.ToLower(text)
-	for _, w := range e.wakeWords {
-		wl := strings.ToLower(w)
-		lower = strings.ReplaceAll(lower, wl, "")
-	}
-	return strings.TrimSpace(lower)
-}
-
-// isJustWakeWord returns true if the text is only whitespace or
-// punctuation (i.e. the wake word was the entire utterance).
-func isJustWakeWord(s string) bool {
-	for _, r := range s {
-		if r != ' ' && r != ',' && r != '.' && r != '!' && r != '?' {
-			return false
-		}
-	}
-	return true
-}
-
-// ── Recording ────────────────────────────────────────────────────
-
-// recordChunk does one recording cycle with the given duration and
-// returns the transcribed text.
-func (e *Ear) recordChunk(ctx context.Context, duration time.Duration) string {
+	// ── Whisper transcriber (single instance for the session) ────
 	var result string
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -449,40 +372,138 @@ func (e *Ear) recordChunk(ctx context.Context, duration time.Duration) string {
 
 	verbose := e.log.GetLevel() >= logger.LevelVerbose
 	t, err := audiotranscriber.NewTranscriber(
-		e.whisperBin,
-		e.modelPath,
-		e.tempDir,
-		"wav",
-		callback,
-		verbose,
+		e.whisperBin, e.modelPath, e.tempDir, "wav", callback, verbose,
 	)
 	if err != nil {
 		e.log.Error("ear: transcriber init failed: %v", err)
-		time.Sleep(2 * time.Second)
-		return ""
+		monStream.Stop()
+		monStream.Close()
+		e.setState(earDormant)
+		return false
 	}
-
 	if err := t.Start(); err != nil {
 		e.log.Error("ear: recording start failed: %v", err)
-		time.Sleep(2 * time.Second)
-		return ""
+		monStream.Stop()
+		monStream.Close()
+		e.setState(earDormant)
+		return false
 	}
 
-	select {
-	case <-time.After(duration):
-	case <-ctx.Done():
-		t.Stop()
-		wg.Wait()
-		return ""
+	// ── Monitor loop ─────────────────────────────────────────────
+	deadline := time.After(e.listenTimeout)
+	lastLoud := time.Now()
+	heardSpeech := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			goto cleanup
+		case <-deadline:
+			e.log.Debug("ear: listen timeout reached")
+			goto cleanup
+		case <-e.cancelCh:
+			e.log.Debug("ear: listening cancelled")
+			goto cleanup
+		default:
+		}
+
+		if err := monStream.Read(); err != nil {
+			e.log.Debug("ear: monitor read error: %v", err)
+			goto cleanup
+		}
+
+		var sumSq float64
+		for _, s := range monBuf {
+			sumSq += float64(s) * float64(s)
+		}
+		rms := math.Sqrt(sumSq / float64(len(monBuf)))
+
+		// Ignore audio while the mouth is speaking — otherwise TTS
+		// playback bleeds into the mic and gets treated as user speech.
+		if e.mouth != nil && e.mouth.IsSpeaking() {
+			continue
+		}
+
+		if rms >= rmsThresh {
+			lastLoud = time.Now()
+			if !heardSpeech {
+				heardSpeech = true
+				e.log.Debug("ear: speech detected (rms=%.4f)", rms)
+			}
+		}
+
+		if heardSpeech && time.Since(lastLoud) >= silenceDur {
+			e.log.Debug("ear: %.0fs silence after speech — done listening", silenceDur.Seconds())
+			goto cleanup
+		}
+
+		if !heardSpeech && time.Since(lastLoud) >= graceDur {
+			e.log.Debug("ear: no speech within grace period")
+			goto cleanup
+		}
 	}
+
+cleanup:
+	monStream.Stop()
+	monStream.Close()
 
 	t.Stop()
 	wg.Wait()
 
-	return result
+	e.setState(earDormant)
+
+	combined := strings.TrimSpace(result)
+	combined = cleanTranscription(combined)
+	combined = stripWakeWordText(combined)
+	combined = e.stripMouthEcho(combined)
+	combined = strings.TrimSpace(combined)
+
+	if combined == "" {
+		e.log.Debug("ear: listening ended with no input")
+		return false
+	}
+
+	e.log.Info("ear: heard command: %q", combined)
+
+	select {
+	case e.textCh <- combined:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
-// ── Transcription cleanup ────────────────────────────────────────
+// ── Text cleanup ─────────────────────────────────────────────────
+
+// stripMouthEcho removes text that matches what the mouth recently
+// spoke — prevents the STT from feeding back TTS output as a command.
+func (e *Ear) stripMouthEcho(text string) string {
+	if e.mouth == nil {
+		return text
+	}
+	last := e.mouth.LastSpoken()
+	if last == "" {
+		return text
+	}
+	lower := strings.ToLower(text)
+	lastLower := strings.ToLower(last)
+	if strings.Contains(lower, lastLower) {
+		cleaned := strings.ReplaceAll(lower, lastLower, "")
+		e.log.Debug("ear: stripped mouth echo from transcription")
+		return strings.TrimSpace(cleaned)
+	}
+	return text
+}
+
+// stripWakeWordText removes any wake-word text fragments that may
+// bleed into the whisper transcription.
+func stripWakeWordText(text string) string {
+	lower := strings.ToLower(text)
+	for _, w := range wakeWordTexts {
+		lower = strings.ReplaceAll(lower, w, "")
+	}
+	return strings.TrimSpace(lower)
+}
 
 // cleanTranscription strips whitespace, normalizes newlines, and
 // removes common whisper artifacts like "[BLANK_AUDIO]", "(silence)",
@@ -549,8 +570,7 @@ func cleanTranscription(s string) string {
 	s = strings.TrimSpace(s)
 
 	// Catch-all: strip any remaining (parenthesized) or [bracketed]
-	// environmental annotations that whisper may produce, e.g.
-	// "(dog barking)", "[laughter]", "(speaking French)", etc.
+	// environmental annotations that whisper may produce.
 	s = envAnnotation.ReplaceAllString(s, "")
 	for strings.Contains(s, "  ") {
 		s = strings.ReplaceAll(s, "  ", " ")

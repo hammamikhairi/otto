@@ -126,9 +126,9 @@ func LineNextPreview(nextOrder int, instruction string) string {
 	return fmt.Sprintf("Coming up next, step %d: %s", nextOrder, instruction)
 }
 
-// LineCanContinue tells the user they can move on while a timer runs.
+// LineCanContinue tells the user they can move on — the timer will auto-start.
 func LineCanContinue(timerLabel string) string {
-	return fmt.Sprintf("The %s timer is running in the background. Carry on.", timerLabel)
+	return fmt.Sprintf("The %s timer will start automatically when you move on. Carry on.", timerLabel)
 }
 
 // LineMustWait tells the user they need to wait for the timer before moving on.
@@ -173,7 +173,7 @@ var thinkingModify = []string{
 	"Alright, working on that.",
 	"Give me a moment to figure this out.",
 	"Okay, let me adjust things.",
-	"One sec, reworking the recipe.",
+	"One second, reworking the recipe.",
 	"Hang on, making changes.",
 	"Let me sort that out for you.",
 	"On it. Give me a second.",
@@ -184,7 +184,7 @@ var thinkingModify = []string{
 }
 
 var thinkingClassify = []string{
-	"Hmm, one sec.",
+	"Hmm, one second.",
 	"Let me figure out what you mean.",
 	"Hold on.",
 	"Give me a moment.",

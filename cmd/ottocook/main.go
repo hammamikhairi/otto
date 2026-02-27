@@ -29,6 +29,7 @@ import (
 	"github.com/hammamikhairi/ottocook/internal/speech"
 	"github.com/hammamikhairi/ottocook/internal/storage"
 	"github.com/hammamikhairi/ottocook/internal/timer"
+	"github.com/hammamikhairi/ottocook/internal/wakeword"
 )
 
 func main() {
@@ -44,7 +45,11 @@ func main() {
 	voice := flag.Bool("voice", false, "enable voice input via local Whisper STT")
 	whisperBin := flag.String("whisper-bin", "whisper-cli", "path to the whisper-cpp CLI binary")
 	whisperModel := flag.String("whisper-model", "bin/ggml-small.bin", "path to the Whisper GGML model file")
-	recordSecs := flag.Int("record-secs", 2, "seconds per voice recording chunk")
+	wwModel := flag.String("ww-model", "models/hey_otto.onnx", "path to the wakeword ONNX model")
+	wwMelspec := flag.String("ww-melspec", "bin/melspectrogram.onnx", "path to the melspectrogram ONNX model")
+	wwEmbed := flag.String("ww-embed", "bin/embedding_model.onnx", "path to the embedding ONNX model")
+	wwLib := flag.String("ww-lib", "bin/libonnxruntime.dylib", "path to the ONNX Runtime shared library")
+	wwThreshold := flag.Float64("ww-threshold", 0.7, "wakeword detection threshold [0.0-1.0]")
 	flag.Parse()
 
 	// Configure logger.
@@ -146,12 +151,34 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error: whisper model not found at %s\n", *whisperModel)
 			os.Exit(1)
 		}
+		// Validate wakeword model files.
+		for _, p := range []string{*wwModel, *wwMelspec, *wwEmbed, *wwLib} {
+			if _, err := os.Stat(p); err != nil {
+				fmt.Fprintf(os.Stderr, "error: wakeword file not found: %s\n", p)
+				os.Exit(1)
+			}
+		}
+
 		os.MkdirAll(".otto-stt", 0o755)
-		ear = speech.NewEar(*whisperBin, *whisperModel, mouth, log,
-			speech.WithRecordDuration(time.Duration(*recordSecs)*time.Second),
-		)
+
+		// Create the ONNX-based wakeword detector.
+		detector := wakeword.New(wakeword.Config{
+			WakewordModel:  *wwModel,
+			MelspecModel:   *wwMelspec,
+			EmbeddingModel: *wwEmbed,
+			OnnxLib:        *wwLib,
+			Threshold:      *wwThreshold,
+		}, log)
+		go func() {
+			if err := detector.Start(ctx); err != nil {
+				log.Error("wakeword detector failed: %v", err)
+			}
+		}()
+		log.Info("wakeword detector started (model=%s, threshold=%.2f)", *wwModel, *wwThreshold)
+
+		ear = speech.NewEar(*whisperBin, *whisperModel, detector, mouth, log)
 		go ear.Run(ctx)
-		log.Info("voice input enabled (bin=%s, model=%s, chunk=%ds)", *whisperBin, *whisperModel, *recordSecs)
+		log.Info("voice input enabled (bin=%s, model=%s)", *whisperBin, *whisperModel)
 	}
 
 	// Start background timer supervisor.
@@ -170,19 +197,69 @@ func main() {
 		ui:       ui,
 	}
 
-	fmt.Println(display.RenderBanner())
+	// Wire space-on-empty-input to interrupt TTS and cancel listening.
+	ui.OnInterrupt(func() {
+		if mouth != nil {
+			mouth.Interrupt()
+		}
+		if ear != nil {
+			ear.CancelListening()
+		}
+	})
 
-	if ear != nil {
-		fmt.Println(display.BannerStyle.Render("  Voice mode ON — say \"Hey Chef\" to activate, or type commands."))
-		fmt.Println(display.BannerStyle.Render("  Type 'quit' to exit."))
-	} else {
-		fmt.Println(display.BannerStyle.Render("  Type 'help' for commands, 'quit' to exit."))
+	// Mute the ear while the mouth is speaking so the wakeword detector
+	// and Whisper transcriber don't pick up the speaker output.
+	// Also update the inspector box for the mouth state.
+	if mouth != nil {
+		ui.SetMouthState(display.MouthIdle)
+
+		mouth.OnSpeakingChange(func(speaking bool) {
+			if speaking {
+				ui.SetMouthState(display.MouthSpeaking)
+				if ear != nil {
+					ear.Mute()
+				}
+			} else {
+				ui.SetMouthState(display.MouthIdle)
+				if ear != nil {
+					ear.Unmute()
+				}
+			}
+		})
 	}
-	fmt.Println()
+
+	// Wire voice-listening state to the ear badge only.
+	// The activity spinner is reserved for AI operations (Thinking…, etc.).
+	if ear != nil {
+		ui.SetEarState(display.EarReady)
+		// Pass timing constants so the inspector can show countdowns.
+		ui.SetEarTimingConstants(15*time.Second, 4*time.Second, 10*time.Second)
+
+		ear.OnStateChange(func(state speech.EarState) {
+			switch state {
+			case speech.EarListening:
+				ui.SetEarState(display.EarActive)
+			case speech.EarMuted:
+				ui.SetEarState(display.EarSleeping)
+			default: // EarDormant
+				ui.SetEarState(display.EarReady)
+			}
+		})
+	}
 
 	// Run app logic in a background goroutine.
 	go func() {
 		ui.WaitReady()
+
+		// Print banner inside alt-screen so it's visible.
+		if ear != nil {
+			ui.Println(display.BannerStyle.Render("  Voice mode ON — say \"Hey Chef\" to activate, or type commands."))
+			ui.Println(display.BannerStyle.Render("  Type 'quit' to exit."))
+		} else {
+			ui.Println(display.BannerStyle.Render("  Type 'help' for commands, 'quit' to exit."))
+		}
+		ui.Println("")
+
 		app.run(ctx)
 		ui.Quit()
 	}()
@@ -375,8 +452,10 @@ func (a *cliApp) classifyAndDispatch(ctx context.Context, original *domain.Inten
 		a.mouth.Say(filler, speech.PriorityCritical)
 	}
 
+	a.ui.SetActivity("Classifying...")
 	recipe, session := a.gatherContext(ctx)
 	classified, err := a.agent.Classify(ctx, original.Payload, recipe, session)
+	a.ui.ClearActivity()
 	if err != nil {
 		a.log.Error("AI classify failed: %v", err)
 		a.say(speech.LineUnknown(original.Payload), speech.PriorityLow)
@@ -406,9 +485,11 @@ func (a *cliApp) askQuestion(ctx context.Context, question string) {
 		a.mouth.Say(filler, speech.PriorityCritical)
 	}
 
+	a.ui.SetActivity("Thinking...")
 	recipe, session := a.gatherContext(ctx)
 
 	answer, err := a.agent.AskQuestion(ctx, question, recipe, session)
+	a.ui.ClearActivity()
 	if err != nil {
 		a.log.Error("AI question failed: %v", err)
 		a.say(speech.LineAIError(), speech.PriorityNormal)
@@ -431,14 +512,22 @@ func (a *cliApp) modifyRequest(ctx context.Context, request string) {
 		a.mouth.Say(filler, speech.PriorityCritical)
 	}
 
+	a.ui.SetActivity("Modifying...")
 	recipe, session := a.gatherContext(ctx)
 
 	if recipe == nil {
+		a.ui.ClearActivity()
 		a.say(speech.LinePickRecipeFirst(), speech.PriorityNormal)
 		return
 	}
 
+	// Snapshot ingredients + steps BEFORE mutation for diffing.
+	oldIngs := snapshotIngredients(recipe)
+	oldSteps := snapshotSteps(recipe)
+	oldServings := recipe.Servings
+
 	resp, err := a.agent.Modify(ctx, request, recipe, session)
+	a.ui.ClearActivity()
 	if err != nil {
 		a.log.Error("AI modify failed: %v", err)
 		a.say(speech.LineAIError(), speech.PriorityNormal)
@@ -459,23 +548,153 @@ func (a *cliApp) modifyRequest(ctx context.Context, request string) {
 			a.log.Error("persisting recipe update failed: %v", err)
 		}
 
-		// Print a summary of what changed.
-		a.ui.PrintStep(fmt.Sprintf("%d modification(s) applied", len(resp.Actions)))
-		for i, act := range resp.Actions {
-			line := fmt.Sprintf("%d. %s", i+1, act.Type)
-			if act.IngredientName != "" {
-				line += ": " + act.IngredientName
-			}
-			if act.StepIndex > 0 {
-				line += fmt.Sprintf(" (step %d)", act.StepIndex)
-			}
-			a.ui.PrintInstruction(line)
-		}
-
+		// Display recipe diff.
+		a.showRecipeDiff(recipe, oldIngs, oldSteps, oldServings)
 	}
 
 	// Speak the summary.
 	a.say(resp.Summary, speech.PriorityHigh)
+}
+
+// ── Recipe diff helpers ──────────────────────────────────────────
+
+type ingredientSnap struct {
+	Name           string
+	Quantity       float64
+	Unit           string
+	SizeDescriptor string
+	Optional       bool
+}
+
+func fmtIngredient(ing domain.Ingredient) string {
+	opt := ""
+	if ing.Optional {
+		opt = " (optional)"
+	}
+	if ing.Quantity > 0 {
+		if ing.SizeDescriptor != "" {
+			return fmt.Sprintf("%.0f %s %s%s", ing.Quantity, ing.SizeDescriptor, ing.Name, opt)
+		}
+		return fmt.Sprintf("%.0f %s %s%s", ing.Quantity, ing.Unit, ing.Name, opt)
+	}
+	return fmt.Sprintf("%s %s%s", ing.SizeDescriptor, ing.Name, opt)
+}
+
+func fmtIngSnap(s ingredientSnap) string {
+	opt := ""
+	if s.Optional {
+		opt = " (optional)"
+	}
+	if s.Quantity > 0 {
+		if s.SizeDescriptor != "" {
+			return fmt.Sprintf("%.0f %s %s%s", s.Quantity, s.SizeDescriptor, s.Name, opt)
+		}
+		return fmt.Sprintf("%.0f %s %s%s", s.Quantity, s.Unit, s.Name, opt)
+	}
+	return fmt.Sprintf("%s %s%s", s.SizeDescriptor, s.Name, opt)
+}
+
+func snapshotIngredients(r *domain.Recipe) []ingredientSnap {
+	out := make([]ingredientSnap, len(r.Ingredients))
+	for i, ing := range r.Ingredients {
+		out[i] = ingredientSnap{
+			Name:           ing.Name,
+			Quantity:       ing.Quantity,
+			Unit:           ing.Unit,
+			SizeDescriptor: ing.SizeDescriptor,
+			Optional:       ing.Optional,
+		}
+	}
+	return out
+}
+
+func snapshotSteps(r *domain.Recipe) []string {
+	out := make([]string, len(r.Steps))
+	for i, s := range r.Steps {
+		out[i] = s.Instruction
+	}
+	return out
+}
+
+func (a *cliApp) showRecipeDiff(r *domain.Recipe, oldIngs []ingredientSnap, oldSteps []string, oldServings int) {
+	a.ui.PrintStep(fmt.Sprintf("=== %s (updated) ===", r.Name))
+
+	// ── Servings ──
+	if r.Servings != oldServings {
+		a.ui.PrintDiffChanged(fmt.Sprintf("Servings: %d -> %d", oldServings, r.Servings))
+	}
+
+	a.ui.Println("")
+	a.ui.PrintStep("Ingredients:")
+
+	// Build a map of old ingredients by lowercase name for lookup.
+	oldMap := make(map[string]ingredientSnap, len(oldIngs))
+	for _, s := range oldIngs {
+		oldMap[strings.ToLower(s.Name)] = s
+	}
+
+	// Track which old ingredients were matched (to find removals).
+	matched := make(map[string]bool)
+
+	for _, ing := range r.Ingredients {
+		key := strings.ToLower(ing.Name)
+		old, existed := oldMap[key]
+		line := fmtIngredient(ing)
+		if !existed {
+			// New ingredient.
+			a.ui.PrintDiffAdded(line)
+		} else {
+			matched[key] = true
+			oldLine := fmtIngSnap(old)
+			if line != oldLine {
+				a.ui.PrintDiffRemoved(oldLine)
+				a.ui.PrintDiffAdded(line)
+			} else {
+				a.ui.PrintDiffUnchanged(line)
+			}
+		}
+	}
+
+	// Show removed ingredients.
+	for _, s := range oldIngs {
+		if !matched[strings.ToLower(s.Name)] {
+			a.ui.PrintDiffRemoved(fmtIngSnap(s))
+		}
+	}
+
+	// ── Steps ──
+	if len(oldSteps) > 0 || len(r.Steps) > 0 {
+		a.ui.Println("")
+		a.ui.PrintStep("Steps:")
+		maxLen := len(oldSteps)
+		if len(r.Steps) > maxLen {
+			maxLen = len(r.Steps)
+		}
+		for i := 0; i < maxLen; i++ {
+			var oldInst, newInst string
+			if i < len(oldSteps) {
+				oldInst = oldSteps[i]
+			}
+			if i < len(r.Steps) {
+				newInst = r.Steps[i].Instruction
+			}
+
+			label := fmt.Sprintf("%d. ", i+1)
+			if newInst == "" && oldInst != "" {
+				// Step removed.
+				a.ui.PrintDiffRemoved(label + oldInst)
+			} else if oldInst == "" && newInst != "" {
+				// Step added.
+				a.ui.PrintDiffAdded(label + newInst)
+			} else if oldInst != newInst {
+				// Step changed.
+				a.ui.PrintDiffRemoved(label + oldInst)
+				a.ui.PrintDiffAdded(label + newInst)
+			} else {
+				a.ui.PrintDiffUnchanged(label + newInst)
+			}
+		}
+	}
 }
 
 // gatherContext loads the current recipe and session for AI context.
@@ -662,7 +881,7 @@ func (a *cliApp) showCurrentStep(ctx context.Context) {
 		// Check whether timer is pending (not yet started by user).
 		pending, _ := a.engine.HasPendingTimers(ctx, a.sessionID)
 		if pending {
-			a.ui.PrintHint(fmt.Sprintf("Timer ready: %s / %s \u2014 type 'timer' when you're ready to start", step.TimerConfig.Label, formatDuration(step.TimerConfig.Duration)))
+			a.ui.PrintHint(fmt.Sprintf("Timer ready: %s / %s — starts automatically on 'next'", step.TimerConfig.Label, formatDuration(step.TimerConfig.Duration)))
 		} else {
 			a.ui.PrintHint(fmt.Sprintf("Timer: %s / %s", step.TimerConfig.Label, formatDuration(step.TimerConfig.Duration)))
 		}
@@ -691,8 +910,8 @@ func (a *cliApp) showCurrentStep(ctx context.Context) {
 	if nextStep != nil {
 		a.ui.PrintHint("▸ Next: " + truncateStr(nextStep.Instruction, 80))
 
-		// If current step has a timer, tell the user whether they can
-		// move on or need to wait.
+		// If current step has a timer, tell the user they can move on
+		// (the timer auto-starts when they advance).
 		if step.TimerConfig != nil {
 			if nextStep.TimerConfig == nil || nextStep.ID != step.ID {
 				guidance := speech.LineCanContinue(step.TimerConfig.Label)
