@@ -14,7 +14,7 @@ So I built a thing that wouldn't let that happen again. OttoCook sits in your te
 
 The first thing I tried cooking with it was Chicken Alfredo. It worked :)
 
-![The Chicken Alfredo in question](img/chicken-alfredo.jpeg?cache=false)
+![The Chicken Alfredo in question](img/chicken-alfredo.jpeg)
 
 *It was good. A bit thick - that one's on me, not Otto. It kept telling me to add pasta water and I didn't listen. Lesson learned.*
 
@@ -35,26 +35,36 @@ The first thing I tried cooking with it was Chicken Alfredo. It worked :)
 ### Prerequisites
 
 - Go 1.24+
+- [PortAudio](http://www.portaudio.com/) for audio playback
 - Azure Speech key + region (TTS)
 - Azure OpenAI / GPT endpoint + key (AI features)
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) + GGML model (voice input, optional)
 
-### Environment variables
+### Wake word model files
 
-OttoCook loads environment variables from a `.env`. Copy the example and fill in your keys:
+The wake word detector needs three binary files in `bin/`. Download them before building:
 
 ```bash
-cp .env.example .env
+cd bin/
+
+# ONNX Runtime shared library (macOS ARM64)
+curl -L -o ort.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.24.1/onnxruntime-osx-arm64-1.24.1.tgz
+tar xzf ort.tgz
+cp onnxruntime-osx-arm64-1.24.1/lib/libonnxruntime.dylib .
+rm -rf ort.tgz onnxruntime-osx-arm64-1.24.1
+
+# openWakeWord feature models
+curl -L -O https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx
+curl -L -O https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/embedding_model.onnx
 ```
 
-| Variable | Required | Description |
-|---|---|---|
-| `AZURE_SPEECH_KEY` | For TTS | Azure Cognitive Services Speech API key |
-| `AZURE_SPEECH_REGION` | For TTS | Azure Speech region (e.g. `eastus`) |
-| `GPT_CHAT_KEY` | For AI | OpenAI / Azure OpenAI API key |
-| `GPT_CHAT_ENDPOINT` | For AI | Chat completion endpoint URL |
+| File | Source | Version |
+|------|--------|---------|
+| `libonnxruntime.dylib` | [microsoft/onnxruntime](https://github.com/microsoft/onnxruntime/releases/tag/v1.24.1) | v1.24.1 |
+| `melspectrogram.onnx` | [dscripka/openWakeWord](https://github.com/dscripka/openWakeWord/releases/tag/v0.5.1) | v0.5.1 |
+| `embedding_model.onnx` | [dscripka/openWakeWord](https://github.com/dscripka/openWakeWord/releases/tag/v0.5.1) | v0.5.1 |
 
-You can disable TTS with `-no-speech` and AI with `-no-ai` if you don't have the keys.
+> The wakeword model (`hey_otto.onnx`) is included in `models/` and tracked in the repo.
 
 ### Build and run
 
@@ -78,12 +88,7 @@ OttoCook uses [whisper.cpp](https://github.com/ggerganov/whisper.cpp) for local 
    ./bin/ottocook -voice
    ```
 
-> **Windows note:** Voice input pulls in [`gordonklaus/portaudio`](https://github.com/gordonklaus/portaudio) (CGO) for microphone access. On Windows you need:
-> - **GCC via [MinGW-w64](https://www.mingw-w64.org/)** — easiest way is `scoop install gcc` or grab it from [MSYS2](https://www.msys2.org/). Make sure `gcc` is on your PATH.
-> - **PortAudio** — install via MSYS2 (`pacman -S mingw-w64-x86_64-portaudio`) or build from source.
-> - Set `CGO_ENABLED=1` when building (it should be on by default if GCC is found).
->
-> If you don't need voice input, none of this is required — TTS playback uses [`ebitengine/oto`](https://github.com/ebitengine/oto) which works without CGO on Windows.
+> **Note:** This has only been tested on macOS (ARM64). The wake word detector depends on the ONNX Runtime dylib and [malgo](https://github.com/gen2brain/malgo) for audio capture, and the Whisper listener uses [portaudio](https://github.com/gordonklaus/portaudio) — both require CGO. Linux should work with the appropriate ONNX Runtime `.so` and PortAudio installed, but it hasn't been tested. Windows is untested and will likely need additional setup (MinGW, MSYS2, etc.). If you don't need voice input, run with `-no-speech` — TTS playback uses [`ebitengine/oto`](https://github.com/ebitengine/oto) which works without CGO.
 
 ### Flags
 
@@ -91,15 +96,11 @@ OttoCook uses [whisper.cpp](https://github.com/ggerganov/whisper.cpp) for local 
 |------|---------|-------------|
 | `-verbose` | `false` | Debug logging |
 | `-quiet` | `false` | Disable all logging |
-| `-log-file` | `.otto-logs/otto.log` | Log file path (use `"stderr"` for console) |
 | `-no-speech` | `false` | Disable TTS |
 | `-no-ai` | `false` | Disable AI agent |
 | `-voice` | `false` | Enable voice input via Whisper |
-| `-whisper-bin` | `whisper-cli` | Path to the whisper-cpp CLI binary |
-| `-whisper-model` | `bin/ggml-small.bin` | Path to the Whisper GGML model file |
-| `-record-secs` | `2` | Seconds per voice recording chunk |
+| `-whisper-model` | `bin/ggml-small.bin` | Whisper GGML model path |
 | `-disk-cache` | `true` | Persist TTS cache to disk |
-| `-cache-dir` | `.otto-cache` | Directory for persistent TTS audio cache |
 
 ## Commands
 
