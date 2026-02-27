@@ -157,9 +157,15 @@ func (e *Engine) Advance(ctx context.Context, sessionID string) (*domain.Step, e
 	current.Status = domain.StepDone
 	current.CompletedAt = now
 
-	// NOTE: timers for the completed step keep running. They are
-	// only dismissed by the user ("dismiss" command) or when they
-	// fire and the user acknowledges them.
+	// Auto-start any pending timers from the step we're leaving.
+	// The user is moving on, so the timer should begin counting
+	// instead of staying in limbo.
+	for _, ts := range session.TimerStates {
+		if ts.Status == domain.TimerPending {
+			ts.Status = domain.TimerRunning
+			e.log.Debug("auto-started timer %s (%s) on advance", ts.ID, ts.Duration)
+		}
+	}
 
 	// Move to next step.
 	nextIdx := session.CurrentStepIndex + 1
@@ -210,9 +216,13 @@ func (e *Engine) Skip(ctx context.Context, sessionID string) (*domain.Step, erro
 	session.StepStates[session.CurrentStepIndex].Status = domain.StepSkipped
 	session.StepStates[session.CurrentStepIndex].CompletedAt = now
 
-	// NOTE: timers for the skipped step keep running. They are
-	// only dismissed by the user ("dismiss" command) or when they
-	// fire and the user acknowledges them.
+	// Auto-start any pending timers from the step we're skipping.
+	for _, ts := range session.TimerStates {
+		if ts.Status == domain.TimerPending {
+			ts.Status = domain.TimerRunning
+			e.log.Debug("auto-started timer %s (%s) on skip", ts.ID, ts.Duration)
+		}
+	}
 
 	nextIdx := session.CurrentStepIndex + 1
 	if nextIdx >= len(recipe.Steps) {
