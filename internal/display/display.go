@@ -266,16 +266,20 @@ func (u *UI) PrintDiffUnchanged(text string) {
 
 // PrintVoice prints a voice-recognised input line.
 func (u *UI) PrintVoice(text string) {
-	sep := sepLineStyle.Render("  " + strings.Repeat("╌", 46))
-	echo := secondaryStyle.Render("otto> [heard] ") + primaryStyle.Render(text)
-	u.Println(sep + "\n" + echo)
+	if u.program != nil && !u.done.Load() {
+		u.program.Send(voiceInputEchoMsg{text: text})
+		return
+	}
+	fmt.Println("otto> [heard] " + text)
 }
 
 // PrintUserInput echoes the user's typed command into the scrollback.
 func (u *UI) PrintUserInput(text string) {
-	sep := sepLineStyle.Render("  " + strings.Repeat("╌", 46))
-	echo := promptStyle.Render("otto") + secondaryStyle.Render("> ") + userInputEchoStyle.Render(text)
-	u.Println(sep + "\n" + echo)
+	if u.program != nil && !u.done.Load() {
+		u.program.Send(userInputEchoMsg{text: text})
+		return
+	}
+	fmt.Println("otto> " + text)
 }
 
 // SetActivity shows an animated spinner with the given label above the
@@ -321,13 +325,10 @@ func (u *UI) Run() error {
 	ti.Width = 60 // updated on first WindowSizeMsg
 
 	m := model{
-		store:   u.store,
-		input:   ti,
-		inputCh: u.inputCh,
-		readyCh: u.readyCh,
-		echoFn: func(v string) {
-			u.PrintUserInput(v)
-		},
+		store:            u.store,
+		input:            ti,
+		inputCh:          u.inputCh,
+		readyCh:          u.readyCh,
 		interruptFn:      u.interruptFn,
 		earListenTimeout: u.earListenTimeout,
 		earSilenceDur:    u.earSilenceDur,
@@ -351,8 +352,7 @@ type model struct {
 	input       textinput.Model
 	inputCh     chan<- string
 	readyCh     chan struct{}
-	echoFn      func(string) // prints user input into scrollback
-	interruptFn func()       // called on space-when-empty ("shut up")
+	interruptFn func() // called on space-when-empty ("shut up")
 	timers      []timerInfo
 	width       int
 	height      int
@@ -392,6 +392,12 @@ type timerInfo struct {
 
 // Messages.
 type tickMsg time.Time
+
+// userInputEchoMsg wraps typed user input into the scrollback with line wrapping.
+type userInputEchoMsg struct{ text string }
+
+// voiceInputEchoMsg wraps voice-recognised input into the scrollback with line wrapping.
+type voiceInputEchoMsg struct{ text string }
 
 // typewriterStartMsg begins a new typewriter line.
 type typewriterStartMsg struct {
@@ -497,12 +503,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.Reset()
 			if strings.TrimSpace(v) != "" {
 				m.inputCh <- v
-				// Return a Cmd that prints the echo — this runs
-				// outside Update so it won't deadlock on msgs.
-				echoFn := m.echoFn
 				return m, func() tea.Msg {
-					echoFn(v)
-					return nil
+					return userInputEchoMsg{text: v}
 				}
 			}
 			return m, nil
@@ -512,8 +514,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		const promptLen = 6
-		if msg.Width > promptLen {
-			m.input.Width = msg.Width - promptLen
+		if msg.Width > promptLen+1 {
+			m.input.Width = msg.Width - promptLen - 1
 		}
 		return m, nil
 
@@ -602,6 +604,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mouthSpeakSince = time.Time{}
 		}
 		m.mouthState = msg.state
+		return m, nil
+
+	case userInputEchoMsg:
+		w := m.width
+		if w <= 0 {
+			w = 80
+		}
+		sep := sepLineStyle.Render("  " + strings.Repeat("╌", 46))
+		m.messages = append(m.messages, sep)
+		prefix := promptStyle.Render("otto") + secondaryStyle.Render("> ")
+		prefixW := lipgloss.Width(prefix)
+		wrapped := wrapText(msg.text, w-prefixW)
+		for i, line := range wrapped {
+			if i == 0 {
+				m.messages = append(m.messages, prefix+userInputEchoStyle.Render(line))
+			} else {
+				m.messages = append(m.messages, strings.Repeat(" ", prefixW)+userInputEchoStyle.Render(line))
+			}
+		}
+		return m, nil
+
+	case voiceInputEchoMsg:
+		w := m.width
+		if w <= 0 {
+			w = 80
+		}
+		sep := sepLineStyle.Render("  " + strings.Repeat("╌", 46))
+		m.messages = append(m.messages, sep)
+		prefix := secondaryStyle.Render("otto> [heard] ")
+		prefixW := lipgloss.Width(prefix)
+		wrapped := wrapText(msg.text, w-prefixW)
+		for i, line := range wrapped {
+			if i == 0 {
+				m.messages = append(m.messages, prefix+primaryStyle.Render(line))
+			} else {
+				m.messages = append(m.messages, strings.Repeat(" ", prefixW)+primaryStyle.Render(line))
+			}
+		}
 		return m, nil
 
 	case appendMsg:
